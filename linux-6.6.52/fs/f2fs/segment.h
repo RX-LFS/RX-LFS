@@ -74,6 +74,10 @@ static inline void sanity_check_seg_type(struct f2fs_sb_info *sbi,
 #define MAIN_SEGS(sbi)	(SM_I(sbi)->main_segments)
 #define MAIN_SECS(sbi)	((sbi)->total_sections)
 
+#if S4
+#define START_SEGNO_HOT(sbi) (MAIN_SEGS(sbi) - (sbi)->max_victim_search)
+#endif
+
 #define TOTAL_SEGS(sbi)							\
 	(SM_I(sbi) ? SM_I(sbi)->segment_count : 				\
 		le32_to_cpu(F2FS_RAW_SUPER(sbi)->segment_count))
@@ -136,6 +140,18 @@ static inline void sanity_check_seg_type(struct f2fs_sb_info *sbi,
 #define SECTOR_TO_BLOCK(sectors)					\
 	((sectors) >> F2FS_LOG_SECTORS_PER_BLOCK)
 
+/* Notice: The order of dirty type is same with CURSEG_XXX in f2fs.h */
+enum dirty_type {
+	DIRTY_HOT_DATA,		/* dirty segments assigned as hot data logs */
+	DIRTY_WARM_DATA,	/* dirty segments assigned as warm data logs */
+	DIRTY_COLD_DATA,	/* dirty segments assigned as cold data logs */
+	DIRTY_HOT_NODE,		/* dirty segments assigned as hot node logs */
+	DIRTY_WARM_NODE,	/* dirty segments assigned as warm node logs */
+	DIRTY_COLD_NODE,	/* dirty segments assigned as cold node logs */
+	DIRTY,			/* to count # of dirty segments */
+	PRE,			/* to count # of entirely obsolete segments */
+	NR_DIRTY_TYPE
+};
 /*
  * In the victim_sel_policy->alloc_mode, there are three block allocation modes.
  * LFS writes data sequentially with cleaning operations.
@@ -189,6 +205,9 @@ struct victim_sel_policy {
 	unsigned int min_segno;		/* segment # having min. cost */
 	unsigned long long age;		/* mtime of GCed section*/
 	unsigned long long age_threshold;/* age threshold */
+#if S4 || ENTROPY
+  int dirty_type;
+#endif
 };
 
 struct seg_entry {
@@ -207,6 +226,16 @@ struct seg_entry {
 	unsigned char *ckpt_valid_map;	/* validity bitmap of blocks last cp */
 	unsigned char *discard_map;
 	unsigned long long mtime;	/* modification time of the segment */
+#if S4
+  struct list_head bucket_pos[NR_DIRTY_TYPE]; 
+  unsigned int segno;
+#endif
+#if ENTROPY
+  unsigned int segno;
+  int last_ckpt_valid_blocks;
+  struct list_head entropy_history_pos;
+  struct list_head bucket_pos[NR_DIRTY_TYPE];
+#endif
 };
 
 struct sec_entry {
@@ -221,6 +250,17 @@ struct revoke_entry {
 	pgoff_t index;
 };
 
+#if ENTROPY
+struct history_entry {
+  struct list_head pos;
+  unsigned int bucket;
+};
+struct frequency_entry {
+  unsigned int bucket;
+  int frequency;
+  long invalid_cnt;
+};
+#endif
 struct sit_info {
 	block_t sit_base_addr;		/* start block address of SIT area */
 	block_t sit_blocks;		/* # of blocks used by SIT area */
@@ -252,7 +292,39 @@ struct sit_info {
 	unsigned long long dirty_max_mtime;	/* rerange candidates in GC_AT */
 
 	unsigned int last_victim[MAX_GC_POLICY]; /* last victim segment # */
+
+#if S4
+  //valid block count 0~512
+  struct list_head hot_victim_buckets[NR_DIRTY_TYPE][513]; 
+  struct list_head cold_victim_buckets[NR_DIRTY_TYPE][513]; 
+#if S5
+  int min_cost;
+#endif
+#elif ENTROPY // S4  
+  struct list_head entropy_victim_buckets[ENTROPY_BUCKET_NR][NR_DIRTY_TYPE]; 
+  struct list_head entropy_history;
+  //struct history_entry history_elems[ENTROPY_HISTORY_NR]; 
+  struct history_entry *history_elems; 
+  unsigned int entropy_history_cnt;
+  unsigned int entropy_bucket_width;
+  unsigned int entropy_history_nr;
+
+  struct frequency_entry frequency[ENTROPY_BUCKET_NR];
+  struct frequency_entry freq_sorted[ENTROPY_BUCKET_NR];
+
+  long bucket_invalid_cnt[ENTROPY_BUCKET_NR][NR_DIRTY_TYPE];
+  long bucket_length[ENTROPY_BUCKET_NR][NR_DIRTY_TYPE];
+
+  unsigned int cur_bucket[NR_DIRTY_TYPE];
+  unsigned int cur_bucket_last_victim[NR_DIRTY_TYPE];
+
+  unsigned int bucket_selected[NR_DIRTY_TYPE];
+#endif
+#if S4_MONITOR
+  unsigned int cnt_bin[6]; // free  ~128 ~256 ~384 ~512 full // based on ckpt_valid_blocks
+#endif
 };
+
 
 struct free_segmap_info {
 	unsigned int start_segno;	/* start segment number logically */
@@ -263,18 +335,6 @@ struct free_segmap_info {
 	unsigned long *free_secmap;	/* free section bitmap */
 };
 
-/* Notice: The order of dirty type is same with CURSEG_XXX in f2fs.h */
-enum dirty_type {
-	DIRTY_HOT_DATA,		/* dirty segments assigned as hot data logs */
-	DIRTY_WARM_DATA,	/* dirty segments assigned as warm data logs */
-	DIRTY_COLD_DATA,	/* dirty segments assigned as cold data logs */
-	DIRTY_HOT_NODE,		/* dirty segments assigned as hot node logs */
-	DIRTY_WARM_NODE,	/* dirty segments assigned as warm node logs */
-	DIRTY_COLD_NODE,	/* dirty segments assigned as cold node logs */
-	DIRTY,			/* to count # of dirty segments */
-	PRE,			/* to count # of entirely obsolete segments */
-	NR_DIRTY_TYPE
-};
 
 struct dirty_seglist_info {
 	unsigned long *dirty_segmap[NR_DIRTY_TYPE];
@@ -412,6 +472,11 @@ static inline void seg_info_to_raw_sit(struct seg_entry *se,
 	__seg_info_to_raw_sit(se, rs);
 
 	memcpy(se->ckpt_valid_map, rs->valid_map, SIT_VBLOCK_MAP_SIZE);
+#if ENTROPY
+  if (se->last_ckpt_valid_blocks == -1) {
+    se->last_ckpt_valid_blocks = se->ckpt_valid_blocks;
+  }
+#endif
 	se->ckpt_valid_blocks = se->valid_blocks;
 }
 
@@ -967,3 +1032,55 @@ static inline unsigned int first_zoned_segno(struct f2fs_sb_info *sbi)
 			return GET_SEGNO(sbi, FDEV(devi).start_blk);
 	return 0;
 }
+
+#if S4
+static inline void move_bucket(struct f2fs_sb_info *sbi, struct seg_entry *se, int dst, int dirty_type){
+  struct sit_info *sit_i = SIT_I(sbi);
+  struct list_head *seg_bucket_pos;
+  struct list_head (*buckets)[513]; 
+  if (se->segno < START_SEGNO_HOT(sbi)) {
+    buckets = sit_i->hot_victim_buckets; 
+  } else {
+    buckets = sit_i->cold_victim_buckets;
+  }
+  seg_bucket_pos = &se->bucket_pos[dirty_type];
+  list_move_tail(seg_bucket_pos, &buckets[dirty_type][dst]);
+  
+  if (dst != se->ckpt_valid_blocks && dst != se->valid_blocks) {
+    printk("%d %u %u %d", dst, se->ckpt_valid_blocks, se->valid_blocks, dirty_type);
+    f2fs_bug_on(sbi, 1);
+  }
+
+#if S5
+  if (dst < sit_i->min_cost) {
+    sit_i->min_cost = dst;
+  }
+#endif
+}
+#endif
+#if ENTROPY
+static inline void add_history(struct f2fs_sb_info *sbi, unsigned int segno) {
+  struct sit_info *sit_i = SIT_I(sbi);
+  struct history_entry * target;
+
+  if (sit_i->entropy_history_cnt >= sit_i->entropy_history_nr) {
+    target = list_first_entry(&sit_i->entropy_history, struct history_entry, pos);
+    list_del(&target->pos);
+    sit_i->frequency[target->bucket].frequency--;
+    //old_sentry = list_first_entry(&sit_i->entropy_history, struct seg_entry, entropy_history_pos);
+    //list_del(&old_sentry->entropy_history_pos);
+  } else {
+    target = &sit_i->history_elems[sit_i->entropy_history_cnt];
+    sit_i->entropy_history_cnt++;
+  }  
+  target->bucket = 1000 * segno / sit_i->entropy_bucket_width;
+  if (target->bucket >= ENTROPY_BUCKET_NR) {
+    printk("calc error");
+    target->bucket = ENTROPY_BUCKET_NR-1;
+  }
+  sit_i->frequency[target->bucket].frequency++;
+  //  list_add_tail(&sentry->entropy_history_pos, &entropy_history);
+  list_add_tail(&target->pos, &sit_i->entropy_history);
+}
+#endif
+

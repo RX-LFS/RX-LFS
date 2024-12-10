@@ -29,6 +29,17 @@
 #include <linux/fscrypt.h>
 #include <linux/fsverity.h>
 
+// Scalableand swift space salvage
+#define S4 0
+#define S5 0
+#define S4_MONITOR 0
+#define PROFILE_MIDDLE 0
+#define ENTROPY 1
+#define ENTROPY_BUCKET_NR 4
+#define ENTROPY_HISTORY_NR 2000
+//#define ENTROPY_HISTORY_FACTOR 2
+
+
 struct pagevec;
 
 #ifdef CONFIG_F2FS_CHECK_FS
@@ -1806,6 +1817,17 @@ struct f2fs_sb_info {
 	/* For io latency related statistics info in one iostat period */
 	spinlock_t iostat_lat_lock;
 	struct iostat_lat_info *iostat_io_lat;
+#endif
+
+#if S4_MONITOR
+  struct task_struct *monitor_thread;
+#if PROFILE_MIDDLE
+  unsigned long long writepage_time;
+  unsigned long long writepage_cnt;
+  unsigned long long ssr_time;
+  unsigned long long ssr_cnt;
+  unsigned long long ssr_ckpt_valid_blocks;
+#endif
 #endif
 };
 
@@ -3607,7 +3629,11 @@ void f2fs_handle_error_async(struct f2fs_sb_info *sbi, unsigned char error);
 int f2fs_commit_super(struct f2fs_sb_info *sbi, bool recover);
 int f2fs_sync_fs(struct super_block *sb, int sync);
 int f2fs_sanity_check_ckpt(struct f2fs_sb_info *sbi);
-
+#if S4_MONITOR
+int f2fs_monitor_func(void *data);
+int f2fs_start_monitor_thread(struct f2fs_sb_info *sbi);
+void f2fs_stop_monitor_thread(struct f2fs_sb_info *sbi);
+#endif
 /*
  * hash.c
  */

@@ -39,6 +39,12 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/f2fs.h>
 
+#if S4_MONITOR
+#include <linux/delay.h>
+#include <linux/timer.h>
+#include <linux/ktime.h>
+#endif
+
 static struct kmem_cache *f2fs_inode_cachep;
 
 #ifdef CONFIG_F2FS_FAULT_INJECTION
@@ -255,6 +261,87 @@ static match_table_t f2fs_tokens = {
 	{Opt_errors, "errors=%s"},
 	{Opt_err, NULL},
 };
+
+#if S4_MONITOR
+unsigned int f2fs_gc_monitor = 0;
+
+int f2fs_monitor_func(void *data){
+  
+  struct f2fs_sb_info *sbi = data;
+  long time_ms = 60 * 1000;
+  int i;
+  unsigned int ckpt_valid_blocks;
+  int cnt_bin[6] = {0, };
+
+  printk("Start");
+#if PROFILE_MIDDLE
+  sbi->writepage_time = 0;
+  sbi->writepage_cnt = 0;
+  sbi->ssr_time = 0;
+  sbi->ssr_cnt = 0;
+#endif
+  while (!kthread_should_stop()) {
+
+/*
+    ktime_t now = ktime_get_raw();
+    ktime_t next = now + time_ms * 1000000;
+    for (i=0;i<MAIN_SEGS(sbi);i++) {
+      ckpt_valid_blocks = get_seg_entry(sbi, i)->ckpt_valid_blocks; 
+      if (ckpt_valid_blocks == 0) {
+        cnt_bin[0]++;
+      } else {
+        cnt_bin[ckpt_valid_blocks/128 + 1]++;
+      }
+    }
+    now = ktime_get_raw();
+    printk("VB %lld %u %u %u %u %u %u", now, cnt_bin[0], cnt_bin[1], cnt_bin[2],
+      cnt_bin[3], cnt_bin[4], cnt_bin[5]);
+    cnt_bin[0] = 0;
+    cnt_bin[1] = 0;
+    cnt_bin[2] = 0;
+    cnt_bin[3] = 0;
+    cnt_bin[4] = 0;
+    cnt_bin[5] = 0;
+    
+  msleep((next - now) / 1000000);
+*/
+#if PROFILE_MIDDLE
+    printk("%llu %llu %llu %llu %llu", 
+      sbi->writepage_time, sbi->writepage_cnt, 
+      sbi->ssr_time, sbi->ssr_cnt, sbi->ssr_ckpt_valid_blocks);
+    sbi->writepage_time = 0;
+    sbi->writepage_cnt = 0;
+    sbi->ssr_time = 0;
+    sbi->ssr_cnt = 0;
+    sbi->ssr_ckpt_valid_blocks = 0;
+#endif
+    msleep(time_ms);
+  }
+  return 0;
+}
+
+
+int f2fs_start_monitor_thread(struct f2fs_sb_info *sbi)
+{
+  sbi->monitor_thread = kthread_run(f2fs_monitor_func, sbi, "f2fs_monitor"); 
+  if (IS_ERR(sbi->monitor_thread)) {
+    //printk("(%s : %d) start monitor thread failed", __func__, __LINE__);
+    sbi->monitor_thread = NULL;
+    return -ENOMEM;
+  }
+//  printk("(%s : %d) start monitor thread success", __func__, __LINE__);
+  return 0;
+}
+
+void f2fs_stop_monitor_thread(struct f2fs_sb_info *sbi)
+{
+//  printk("(%s : %d) stop monitor thread", __func__, __LINE__);
+  if (sbi->monitor_thread) {
+    kthread_stop(sbi->monitor_thread);
+  }
+}
+#endif
+
 
 void f2fs_printk(struct f2fs_sb_info *sbi, bool limit_rate,
 						const char *fmt, ...)
@@ -1587,6 +1674,10 @@ static void f2fs_put_super(struct super_block *sb)
 	 * after then, all checkpoints should be done by each process context.
 	 */
 	f2fs_stop_ckpt_thread(sbi);
+
+#if S4_MONITOR
+  f2fs_stop_monitor_thread(sbi);
+#endif
 
 	/*
 	 * We don't need to do checkpoint when superblock is clean.
@@ -4710,6 +4801,17 @@ reset_checkpoint:
 
 	f2fs_tuning_parameters(sbi);
 
+#if S4_MONITOR
+  err = f2fs_start_monitor_thread(sbi);
+  if (err) {
+    f2fs_err(sbi,
+        "Failed to start F2FS monitoring thread (%d)",
+        err);
+    f2fs_stop_monitor_thread(sbi);
+  }
+#endif
+
+
 	f2fs_notice(sbi, "Mounted with checkpoint version = %llx",
 		    cur_cp_version(F2FS_CKPT(sbi)));
 	f2fs_update_time(sbi, CP_TIME);
@@ -4876,6 +4978,13 @@ static void destroy_inodecache(void)
 static int __init init_f2fs_fs(void)
 {
 	int err;
+#if S4
+  printk("S4 enabled");
+#elif ENTROPY
+  printk("ENTROPY based");
+#else
+  printk("S4 disabled");
+#endif
 
 	if (PAGE_SIZE != F2FS_BLKSIZE) {
 		printk("F2FS not supported on PAGE_SIZE(%lu) != %d\n",

@@ -746,24 +746,117 @@ static void __locate_dirty_segment(struct f2fs_sb_info *sbi, unsigned int segno,
 		enum dirty_type dirty_type)
 {
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
+  struct sit_info *sit_i = SIT_I(sbi);
+  struct seg_entry *sentry = get_seg_entry(sbi, segno);
+#if S4
+  struct seg_entry *se, *pos;
+  block_t valid_blocks;
+
+  se = get_seg_entry(sbi, segno);
+  valid_blocks = get_valid_blocks(sbi, segno, true);
+#endif
+#if ENTROPY
+  unsigned int bucket;
+#endif
 
 	/* need not be added */
 	if (IS_CURSEG(sbi, segno))
 		return;
 
-	if (!test_and_set_bit(segno, dirty_i->dirty_segmap[dirty_type]))
-		dirty_i->nr_dirty[dirty_type]++;
+#if ENTROPY
+  bucket = 1000 * segno / sit_i->entropy_bucket_width;
+  if (bucket >= ENTROPY_BUCKET_NR) {
+    printk("calc error");
+    bucket = ENTROPY_BUCKET_NR-1;
+  }
+#endif
 
+#if S4
+	if (!test_and_set_bit(segno, dirty_i->dirty_segmap[dirty_type])) {
+		dirty_i->nr_dirty[dirty_type]++;
+    //INSERT
+    if (segno > START_SEGNO_HOT(sbi)) { //hot
+      list_add(&sentry->bucket_pos[dirty_type], &sit_i->hot_victim_buckets[dirty_type][valid_blocks]);
+    } else {
+      list_add(&se->bucket_pos[dirty_type], &sit_i->cold_victim_buckets[dirty_type][valid_blocks]);
+    }
+   // list_add(&se->ckpt_bucket_pos, &sit_i->ckpt_victim_buckets[se->ckpt_valid_blocks]);
+#if S5
+    if (dst < sit_i->min_cost) {
+      sit_i->min_cost = dst;
+    }
+#endif
+
+  } else {
+    move_bucket(sbi, se, valid_blocks, dirty_type);
+    //move_bucket(sbi, se, se->ckpt_valid_blocks, 1);
+  }
+#else //S4
+	if (!test_and_set_bit(segno, dirty_i->dirty_segmap[dirty_type])){
+		dirty_i->nr_dirty[dirty_type]++;
+#if ENTROPY
+    list_add_tail(&sentry->bucket_pos[dirty_type], &sit_i->entropy_victim_buckets[bucket][dirty_type]);
+    sit_i->bucket_length[bucket][dirty_type]++;
+    sit_i->bucket_invalid_cnt[bucket][dirty_type] += 512 - sentry->ckpt_valid_blocks;
+#endif //ENTROPY 
+  } 
+#if ENTROPY
+  else {
+    if (sentry->last_ckpt_valid_blocks != -1) {
+      sit_i->bucket_invalid_cnt[bucket][dirty_type] -= sentry->ckpt_valid_blocks - sentry->last_ckpt_valid_blocks;
+    }
+  }
+
+  if (sit_i->bucket_invalid_cnt[bucket][dirty_type] < 0)
+    printk("(%s:%d)bucket (%u) bucket invalid count underflow (%ld) error in type %d",
+        __func__, __LINE__, bucket, sit_i->bucket_invalid_cnt[bucket][dirty_type], dirty_type);
+
+  if (sit_i->bucket_invalid_cnt[bucket][dirty_type] > sit_i->bucket_length[bucket][dirty_type] * 512)
+    printk("(%s:%d)bucket (%u) bucket invalid count overflow (%ld) error in type %d",
+        __func__, __LINE__, bucket, sit_i->bucket_invalid_cnt[bucket][dirty_type], dirty_type);
+#endif
+#endif // S4
+#if ENTROPY
+//  sit_i->bucket_invalid_cnt[bucket][dirty_type]++;
+//  if (sit_i->bucket_invalid_cnt[bucket][dirty_type] > sit_i->entropy_bucket_width / 1000 * 512)
+    //printk("(%s:%d)bucket invalid block count error", __func__, __LINE__);
+#endif
 	if (dirty_type == DIRTY) {
-		struct seg_entry *sentry = get_seg_entry(sbi, segno);
 		enum dirty_type t = sentry->type;
 
 		if (unlikely(t >= DIRTY)) {
 			f2fs_bug_on(sbi, 1);
 			return;
 		}
-		if (!test_and_set_bit(segno, dirty_i->dirty_segmap[t]))
+		if (!test_and_set_bit(segno, dirty_i->dirty_segmap[t])) {
 			dirty_i->nr_dirty[t]++;
+#if ENTROPY
+    list_add_tail(&sentry->bucket_pos[t], &sit_i->entropy_victim_buckets[bucket][t]);
+    sit_i->bucket_length[bucket][t]++;
+    sit_i->bucket_invalid_cnt[bucket][t] += 512 - sentry->ckpt_valid_blocks;
+#endif 
+    }
+#if ENTROPY
+    else {
+      if (sentry->last_ckpt_valid_blocks != -1) {
+        sit_i->bucket_invalid_cnt[bucket][t] -= sentry->ckpt_valid_blocks - sentry->last_ckpt_valid_blocks;
+      }
+    }
+    if (sit_i->bucket_invalid_cnt[bucket][t] < 0)
+      printk("(%s:%d)bucket (%u) bucket invalid count underflow (%ld) error in type %d",
+          __func__, __LINE__, bucket, sit_i->bucket_invalid_cnt[bucket][t], t);
+
+    if (sit_i->bucket_invalid_cnt[bucket][t] > sit_i->bucket_length[bucket][t] * 512)
+      printk("(%s:%d)bucket (%u) bucket invalid count overflow (%ld) error in type %d",
+          __func__, __LINE__, bucket, sit_i->bucket_invalid_cnt[bucket][t], t);
+
+    sentry->last_ckpt_valid_blocks = -1;
+#endif
+#if ENTROPY
+//  sit_i->bucket_invalid_cnt[bucket][t]++;
+//  if (sit_i->bucket_invalid_cnt[bucket][t] > sit_i->entropy_bucket_width / 1000 * 512 && t == DIRTY_WARM_DATA)
+//    printk("(%s:%d)bucket invalid block count error", __func__, __LINE__);
+#endif
 
 		if (__is_large_section(sbi)) {
 			unsigned int secno = GET_SEC_FROM_SEG(sbi, segno);
@@ -784,17 +877,63 @@ static void __remove_dirty_segment(struct f2fs_sb_info *sbi, unsigned int segno,
 {
 	struct dirty_seglist_info *dirty_i = DIRTY_I(sbi);
 	block_t valid_blocks;
+	struct seg_entry *sentry = get_seg_entry(sbi, segno);
+#if ENTROPY
+  struct sit_info *sit_i = SIT_I(sbi);
+  unsigned int bucket = 1000 * segno / sit_i->entropy_bucket_width;
+  if (bucket >= ENTROPY_BUCKET_NR) {
+    printk("calc error");
+    bucket = ENTROPY_BUCKET_NR-1;
+  }
+#endif
 
-	if (test_and_clear_bit(segno, dirty_i->dirty_segmap[dirty_type]))
+#if S4
+	if (test_and_clear_bit(segno, dirty_i->dirty_segmap[dirty_type])) {
+		dirty_i->nr_dirty[dirty_type]--;
+    struct seg_entry *se = get_seg_entry(sbi, segno);
+    list_del(&se->bucket_pos[dirty_type]);
+    //list_del(&se->ckpt_bucket_pos);
+  }
+
+#else
+	if (test_and_clear_bit(segno, dirty_i->dirty_segmap[dirty_type])) {
 		dirty_i->nr_dirty[dirty_type]--;
 
+#if ENTROPY
+    list_del(&sentry->bucket_pos[dirty_type]);
+    sit_i->bucket_length[bucket][dirty_type]--;
+    if (sentry->last_ckpt_valid_blocks == -1) {
+      sit_i->bucket_invalid_cnt[bucket][dirty_type] -= 512 - sentry->ckpt_valid_blocks;
+    } else {
+      sit_i->bucket_invalid_cnt[bucket][dirty_type] -= 512 - sentry->last_ckpt_valid_blocks;
+    }
+#endif
+  }
+#endif
 	if (dirty_type == DIRTY) {
-		struct seg_entry *sentry = get_seg_entry(sbi, segno);
 		enum dirty_type t = sentry->type;
 
-		if (test_and_clear_bit(segno, dirty_i->dirty_segmap[t]))
+		if (test_and_clear_bit(segno, dirty_i->dirty_segmap[t])) {
 			dirty_i->nr_dirty[t]--;
+#if ENTROPY
+    list_del(&sentry->bucket_pos[t]);
+    sit_i->bucket_length[bucket][t]--;
+    if (sentry->last_ckpt_valid_blocks == -1) {
+      sit_i->bucket_invalid_cnt[bucket][t] -= 512 - sentry->ckpt_valid_blocks;
+    } else {
+      sit_i->bucket_invalid_cnt[bucket][t] -= 512 - sentry->last_ckpt_valid_blocks;
+    }
+    if (sit_i->bucket_invalid_cnt[bucket][t] < 0)
+      printk("(%s:%d)bucket (%u) bucket invalid count underflow (%ld) error in type %d",
+          __func__, __LINE__, bucket, sit_i->bucket_invalid_cnt[bucket][t], t);
 
+    if (sit_i->bucket_invalid_cnt[bucket][t] > sit_i->bucket_length[bucket][t] * 512)
+      printk("(%s:%d)bucket (%u) bucket invalid count overflow (%ld) error in type %d",
+          __func__, __LINE__, bucket, sit_i->bucket_invalid_cnt[bucket][t], t);
+
+    sentry->last_ckpt_valid_blocks = -1;
+#endif
+    }
 		valid_blocks = get_valid_blocks(sbi, segno, true);
 		if (valid_blocks == 0) {
 			clear_bit(GET_SEC_FROM_SEG(sbi, segno),
@@ -2401,6 +2540,16 @@ static void update_sit_entry(struct f2fs_sb_info *sbi, block_t blkaddr, int del)
 	if (segno == NULL_SEGNO)
 		return;
 
+#if ENTROPY
+  struct sit_info *sit_i = SIT_I(sbi);
+  unsigned int bucket;
+  bucket  = 1000 * segno / sit_i->entropy_bucket_width;
+  if (bucket >= ENTROPY_BUCKET_NR) {
+    printk("calc error");
+    bucket = ENTROPY_BUCKET_NR-1;
+  }
+#endif
+
 	se = get_seg_entry(sbi, segno);
 	new_vblocks = se->valid_blocks + del;
 	offset = GET_BLKOFF_FROM_SEG0(sbi, blkaddr);
@@ -2425,6 +2574,7 @@ static void update_sit_entry(struct f2fs_sb_info *sbi, block_t blkaddr, int del)
 		if (unlikely(exist)) {
 			f2fs_err(sbi, "Bitmap was wrongly set, blk:%u",
 				 blkaddr);
+      printk("%u", segno);
 			f2fs_bug_on(sbi, 1);
 			se->valid_blocks--;
 			del = 0;
@@ -2439,8 +2589,14 @@ static void update_sit_entry(struct f2fs_sb_info *sbi, block_t blkaddr, int del)
 		 * or newly invalidated.
 		 */
 		if (!is_sbi_flag_set(sbi, SBI_CP_DISABLED)) {
-			if (!f2fs_test_and_set_bit(offset, se->ckpt_valid_map))
+			if (!f2fs_test_and_set_bit(offset, se->ckpt_valid_map)) {
+#if ENTROPY
+        if (se->last_ckpt_valid_blocks == -1) {
+          se->last_ckpt_valid_blocks = se->ckpt_valid_blocks;
+        }
+#endif
 				se->ckpt_valid_blocks++;
+      }
 		}
 	} else {
 		exist = f2fs_test_and_clear_bit(offset, se->cur_valid_map);
@@ -2477,9 +2633,14 @@ static void update_sit_entry(struct f2fs_sb_info *sbi, block_t blkaddr, int del)
 			f2fs_test_and_clear_bit(offset, se->discard_map))
 			sbi->discard_blks++;
 	}
-	if (!f2fs_test_bit(offset, se->ckpt_valid_map))
+	if (!f2fs_test_bit(offset, se->ckpt_valid_map)) {
+#if ENTROPY
+    if (se->last_ckpt_valid_blocks == -1) {
+      se->last_ckpt_valid_blocks = se->ckpt_valid_blocks;
+    }
+#endif
 		se->ckpt_valid_blocks += del;
-
+  }
 	__mark_sit_entry_dirty(sbi, segno);
 
 	/* update total number of valid blocks to be written in ckpt area */
@@ -3005,11 +3166,13 @@ static int get_ssr_segment(struct f2fs_sb_info *sbi, int type,
 	for (; cnt-- > 0; reversed ? i-- : i++) {
 		if (i == seg_type)
 			continue;
+    //printk("segno %u, seg_type %d, iter %d", segno, seg_type, i);
 		if (!f2fs_get_victim(sbi, &segno, BG_GC, i, alloc_mode, age)) {
 			curseg->next_segno = segno;
 			return 1;
 		}
 	}
+  //printk("ssr get victim failed");
 
 	/* find valid_blocks=0 in dirty list */
 	if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED))) {
@@ -3455,7 +3618,9 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 	*new_blkaddr = NEXT_FREE_BLKADDR(sbi, curseg);
 
 	f2fs_bug_on(sbi, curseg->next_blkoff >= BLKS_PER_SEG(sbi));
-
+  if (curseg->next_blkoff >= BLKS_PER_SEG(sbi)) {
+   // printk("blkoff >= blks_per_seg, blkoff: %u, segno:%u",curseg->next_blkoff, curseg->segno); 
+  }
 	f2fs_wait_discard_bio(sbi, *new_blkaddr);
 
 	curseg->sum_blk->entries[curseg->next_blkoff] = *sum;
@@ -3506,7 +3671,23 @@ void f2fs_allocate_data_block(struct f2fs_sb_info *sbi, struct page *page,
 			else
 				change_curseg(sbi, type);
 			stat_inc_seg_type(sbi, curseg);
+#if ENTROPY
+      add_history(sbi, curseg->segno);
+/*
+      unsigned int bucket = 1000 * curseg->segno / sit_i->entropy_bucket_width;
+      if (bucket >= ENTROPY_BUCKET_NR) {
+        printk("calc error");
+        bucket = ENTROPY_BUCKET_NR-1;
+      }
+      printk("segno %u bucket %d alloc_type %d", curseg->segno, bucket, curseg->alloc_type);
+*/
+#endif
 		}
+/*
+    if (type >= CURSEG_HOT_NODE && type <= CURSEG_COLD_NODE) {
+      printk("segno %u log_type %d alloc_type %d", curseg->segno, type, curseg->alloc_type);
+    }
+*/
 	}
 
 skip_new_segment:
@@ -3587,6 +3768,11 @@ static void do_write_page(struct f2fs_summary *sum, struct f2fs_io_info *fio)
 
 	/* writeout dirty page into bdev */
 	f2fs_submit_page_write(fio);
+#if S4
+	if (GET_SEGNO(fio->sbi, fio->old_blkaddr) != NULL_SEGNO) {
+	  f2fs_issue_discard(fio->sbi, fio->old_blkaddr, 1);
+  }
+#endif
 
 	f2fs_update_device_state(fio->sbi, fio->ino, fio->new_blkaddr, 1);
 
@@ -4344,12 +4530,24 @@ void f2fs_flush_sit_entries(struct f2fs_sb_info *sbi, struct cp_control *cpc)
 							cpu_to_le32(segno);
 				seg_info_to_raw_sit(se,
 					&sit_in_journal(journal, offset));
+#if ENTROPY
+        locate_dirty_segment(sbi, segno); 
+#endif
+#if S4
+        locate_dirty_segment(sbi, segno); 
+#endif
 				check_block_count(sbi, segno,
 					&sit_in_journal(journal, offset));
 			} else {
 				sit_offset = SIT_ENTRY_OFFSET(sit_i, segno);
 				seg_info_to_raw_sit(se,
 						&raw_sit->entries[sit_offset]);
+#if ENTROPY
+        locate_dirty_segment(sbi, segno); 
+#endif
+#if S4
+        locate_dirty_segment(sbi, segno); 
+#endif
 				check_block_count(sbi, segno,
 						&raw_sit->entries[sit_offset]);
 			}
@@ -4487,6 +4685,45 @@ static int build_sit_info(struct f2fs_sb_info *sbi)
 	sit_i->elapsed_time = le64_to_cpu(sbi->ckpt->elapsed_time);
 	sit_i->mounted_time = ktime_get_boottime_seconds();
 	init_rwsem(&sit_i->sentry_lock);
+#if S4_MONITOR
+  for (j=0;j<6;j++){
+    sit_i->cnt_bin[j] = 0;
+  }
+#endif
+#if ENTROPY
+  sit_i->entropy_history_cnt = 0;
+  for (int i=0;i<ENTROPY_BUCKET_NR;i++) {
+    sit_i->frequency[i].bucket = i;
+    sit_i->frequency[i].frequency = 0;
+    sit_i->frequency[i].invalid_cnt = 0;
+
+    for (int j=0;j<NR_DIRTY_TYPE;j++) {
+      INIT_LIST_HEAD(&sit_i->entropy_victim_buckets[i][j]);
+      sit_i->bucket_invalid_cnt[i][j] = 0;
+    }
+  }
+  for (int j=0;j<NR_DIRTY_TYPE;j++) {
+    sit_i->cur_bucket[j] = NULL_SEGNO;
+    sit_i->bucket_selected[j] = 0;
+    sit_i->cur_bucket_last_victim[j] = NULL_SEGNO;
+    
+  }
+
+  INIT_LIST_HEAD(&sit_i->entropy_history);
+  sit_i->entropy_bucket_width = 1000 * MAIN_SEGS(sbi) / ENTROPY_BUCKET_NR;
+ 
+#ifdef ENTROPY_HISTORY_FACTOR
+  sit_i->entropy_history_nr = sit_i->entropy_bucket_width * ENTROPY_HISTORY_FACTOR; 
+#else
+  sit_i->entropy_history_nr = ENTROPY_HISTORY_NR;
+#endif
+  sit_i->history_elems = f2fs_kvmalloc(sbi, sit_i->entropy_history_nr * sizeof(struct history_entry), GFP_KERNEL); 
+  for (int i=0;i<sit_i->entropy_history_nr;i++) {
+    INIT_LIST_HEAD(&sit_i->history_elems[i].pos);
+  }
+  printk("Initialize entropy configuation.\n bucket_nr: %u, 1000 * bucket_width(segs): %u, history_nr: %u",
+     ENTROPY_BUCKET_NR, sit_i->entropy_bucket_width, sit_i->entropy_history_nr);
+#endif
 	return 0;
 }
 
@@ -4605,6 +4842,17 @@ static int build_sit_entries(struct f2fs_sb_info *sbi)
 			}
 
 			sit_valid_blocks[SE_PAGETYPE(se)] += se->valid_blocks;
+#if S4
+      for (int j=0;j<NR_DIRTY_TYPE;j++) {
+          INIT_LIST_HEAD(&se->bucket_pos[j]);
+      }
+      //list_add(&se->bucket_pos, &SIT_I(sbi)->victim_buckets[se->valid_blocks]);
+      se->segno = start;
+#endif
+#if ENTROPY
+      se->segno = start;
+      se->last_ckpt_valid_blocks = -1;
+#endif
 
 			if (!f2fs_block_unit_discard(sbi))
 				goto init_discard_map_done;
@@ -5398,6 +5646,9 @@ static void destroy_sit_info(struct f2fs_sb_info *sbi)
 	kvfree(sit_i->sentries);
 	kvfree(sit_i->sec_entries);
 	kvfree(sit_i->dirty_sentries_bitmap);
+#if ENTROPY
+  kvfree(sit_i->history_elems);
+#endif
 
 	SM_I(sbi)->sit_info = NULL;
 	kvfree(sit_i->sit_bitmap);

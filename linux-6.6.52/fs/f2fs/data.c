@@ -29,6 +29,9 @@
 #include <trace/events/f2fs.h>
 
 #define NUM_PREALLOC_POST_READ_CTXS	128
+#if PROFILE_MIDDLE
+#include "calclock.h"
+#endif
 
 static struct kmem_cache *bio_post_read_ctx_cache;
 static struct kmem_cache *bio_entry_slab;
@@ -3320,10 +3323,21 @@ static int f2fs_write_data_pages(struct address_space *mapping,
 			    struct writeback_control *wbc)
 {
 	struct inode *inode = mapping->host;
-
-	return __f2fs_write_data_pages(mapping, wbc,
+  int ret;
+  
+#if PROFILE_MIDDLE
+	struct f2fs_sb_info *sbi = F2FS_I_SB(inode);
+  struct timespec64 ts[2];
+  ktime_get_raw_ts64(&ts[0]);
+#endif
+	ret = __f2fs_write_data_pages(mapping, wbc,
 			F2FS_I(inode)->cp_task == current ?
 			FS_CP_DATA_IO : FS_DATA_IO);
+#if PROFILE_MIDDLE
+  ktime_get_raw_ts64(&ts[1]);
+  calclock(ts, &sbi->writepage_time, &sbi->writepage_cnt);
+#endif
+  return ret;
 }
 
 void f2fs_write_failed(struct inode *inode, loff_t to)

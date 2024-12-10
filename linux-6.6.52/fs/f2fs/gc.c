@@ -23,6 +23,16 @@
 #include "iostat.h"
 #include <trace/events/f2fs.h>
 
+#if ENTROPY
+#include <linux/sort.h>
+#endif
+
+// for latency breakdown
+#define BREAKDOWN 0
+#include "calclock.h"
+
+#define LFS_MAX_VICTIM 0
+
 static struct kmem_cache *victim_entry_slab;
 
 static unsigned int count_bits(const unsigned long *addr,
@@ -252,11 +262,17 @@ static void select_policy(struct f2fs_sb_info *sbi, int gc_type,
 		p->dirty_bitmap = dirty_i->dirty_segmap[type];
 		p->max_search = dirty_i->nr_dirty[type];
 		p->ofs_unit = 1;
+#if S4 || ENTROPY
+    p->dirty_type=type;
+#endif
 	} else if (p->alloc_mode == AT_SSR) {
 		p->gc_mode = GC_GREEDY;
 		p->dirty_bitmap = dirty_i->dirty_segmap[type];
 		p->max_search = dirty_i->nr_dirty[type];
 		p->ofs_unit = 1;
+#if S4 || ENTROPY
+    p->dirty_type=type;
+#endif
 	} else {
 		p->gc_mode = select_gc_type(sbi, gc_type);
 		p->ofs_unit = SEGS_PER_SEC(sbi);
@@ -267,6 +283,9 @@ static void select_policy(struct f2fs_sb_info *sbi, int gc_type,
 		} else {
 			p->dirty_bitmap = dirty_i->dirty_segmap[DIRTY];
 			p->max_search = dirty_i->nr_dirty[DIRTY];
+#if S4 || ENTROPY
+      p->dirty_type = DIRTY;
+#endif
 		}
 	}
 
@@ -279,7 +298,11 @@ static void select_policy(struct f2fs_sb_info *sbi, int gc_type,
 			(p->gc_mode != GC_AT && p->alloc_mode != AT_SSR) &&
 			p->max_search > sbi->max_victim_search)
 		p->max_search = sbi->max_victim_search;
-
+		
+#if 0
+	if (p->max_search > sbi->max_victim_search)
+    p->max_search = sbi->max_victim_search;
+#endif
 	/* let's select beginning hot/small space first. */
 	if (f2fs_need_rand_seg(sbi))
 		p->offset = get_random_u32_below(MAIN_SECS(sbi) *
@@ -731,7 +754,44 @@ static int f2fs_gc_pinned_control(struct inode *inode, int gc_type,
 		f2fs_pin_file_control(inode, true);
 	return -EAGAIN;
 }
+#if ENTROPY
+static inline int compare_freq(const void *a, const void *b){
+    struct frequency_entry arg1 = *(const struct frequency_entry *)a;
+    struct frequency_entry arg2 = *(const struct frequency_entry *)b;
+    return (arg2.frequency - arg1.frequency); 
+}
 
+static inline int compare_invalid_cnt(const void *a, const void *b){
+    struct frequency_entry arg1 = *(const struct frequency_entry *)a;
+    struct frequency_entry arg2 = *(const struct frequency_entry *)b;
+    return (arg2.invalid_cnt - arg1.invalid_cnt); 
+}
+/*
+static inline int compare_valid_cnt(const void *a, const void *b){
+    struct frequency_entry arg1 = *(const struct frequency_entry *)a;
+    struct frequency_entry arg2 = *(const struct frequency_entry *)b;
+    return (arg1.valid_cnt - arg2.valid_cnt); 
+}
+*/
+unsigned int nsearched_in_bucket = 0;
+
+static inline void sort_buckets(struct f2fs_sb_info *sbi, int dirty_type) {
+  struct sit_info *sit_i = SIT_I(sbi);
+
+  for (int i=0;i<ENTROPY_BUCKET_NR;i++) {
+    sit_i->frequency[i].invalid_cnt = sit_i->bucket_invalid_cnt[i][dirty_type];
+    if (sit_i->frequency[i].invalid_cnt < 0) {
+      printk("(%s:%d) invalid cnt underflow", __func__, __LINE__);
+      sit_i->frequency[i].invalid_cnt = 0;
+    }
+  }
+  memcpy(sit_i->freq_sorted, sit_i->frequency, sizeof(sit_i->frequency));
+  sort(sit_i->freq_sorted, ENTROPY_BUCKET_NR, sizeof(struct frequency_entry), compare_invalid_cnt, NULL);
+  sit_i->bucket_selected[dirty_type] = 0;
+}
+
+
+#endif
 /*
  * This function is called from two paths.
  * One is garbage collection and the other is SSR segment selection.
@@ -752,6 +812,18 @@ int f2fs_get_victim(struct f2fs_sb_info *sbi, unsigned int *result,
 	unsigned int nsearched;
 	bool is_atgc;
 	int ret = 0;
+#if S4
+  struct seg_entry *se;
+  int i;
+#endif
+  unsigned int last_searched;
+
+#if PROFILE_MIDDLE
+  struct timespec64 ts[2];
+  if (alloc_mode == SSR) {
+    ktime_get_raw_ts64(&ts[0]);
+  }
+#endif
 
 	mutex_lock(&dirty_i->seglist_lock);
 	last_segment = MAIN_SECS(sbi) * SEGS_PER_SEC(sbi);
@@ -772,9 +844,10 @@ retry:
 	if (is_atgc)
 		SIT_I(sbi)->dirty_min_mtime = ULLONG_MAX;
 
-	if (*result != NULL_SEGNO) {
+	if (*result != NULL_SEGNO) { 
 		if (!get_valid_blocks(sbi, *result, false)) {
 			ret = -ENODATA;
+      printk("(%s%d)", __func__, __LINE__);
 			goto out;
 		}
 
@@ -782,6 +855,7 @@ retry:
 			ret = -EBUSY;
 		else
 			p.min_segno = *result;
+    printk("(%s%d)", __func__, __LINE__);
 		goto out;
 	}
 
@@ -811,95 +885,274 @@ retry:
 		if (p.min_segno != NULL_SEGNO)
 			goto got_it;
 	}
+#if ENTROPY
+  //if (alloc_mode == SSR && p.dirty_type == DIRTY_WARM_DATA) {
+  if (alloc_mode == SSR) {
+    unsigned int bucket;
+    struct list_head *head;
+    struct sit_info *sit_i = SIT_I(sbi);
+    int n = 0;
 
-	while (1) {
-		unsigned long cost, *dirty_bitmap;
-		unsigned int unit_no, segno;
+entropy_resort:
+    if (sit_i->cur_bucket[p.dirty_type] == NULL_SEGNO){
+      nsearched_in_bucket = 0;
 
-		dirty_bitmap = p.dirty_bitmap;
-		unit_no = find_next_bit(dirty_bitmap,
-				last_segment / p.ofs_unit,
-				p.offset / p.ofs_unit);
-		segno = unit_no * p.ofs_unit;
-		if (segno >= last_segment) {
-			if (sm->last_victim[p.gc_mode]) {
-				last_segment =
-					sm->last_victim[p.gc_mode];
-				sm->last_victim[p.gc_mode] = 0;
-				p.offset = 0;
-				continue;
-			}
-			break;
-		}
+      sort_buckets(sbi, p.dirty_type);
+      sit_i->cur_bucket[p.dirty_type] = sit_i->freq_sorted[0].bucket;
+      f2fs_bug_on(sbi, n!=0);
+      sit_i->cur_bucket_last_victim[p.dirty_type] = 
+        sit_i->cur_bucket[p.dirty_type] * sit_i->entropy_bucket_width / 1000;
 
-		p.offset = segno + p.ofs_unit;
-		nsearched++;
+      char result[256] = "";
+      int offset = 0;  // Keep track of where to write next
+      for (int i = 0; i < ENTROPY_BUCKET_NR; i++) {
+        offset += snprintf(result + offset, sizeof(result) - offset,
+            " (%u, %ld)[%ld]", sit_i->freq_sorted[i].bucket, sit_i->freq_sorted[i].invalid_cnt,
+              sit_i->bucket_length[sit_i->freq_sorted[i].bucket][p.dirty_type]);
+        if (offset >= sizeof(result)) {
+          break;  // Stop if result buffer is full
+        }
+      }
+      printk("type %d bucket sort result (bucket, invalid_cnt)[len]: %s", p.dirty_type, result);
+      printk("selected bucket(%d)", sit_i->cur_bucket[p.dirty_type]);
+    }
 
-#ifdef CONFIG_F2FS_CHECK_FS
-		/*
-		 * skip selecting the invalid segno (that is failed due to block
-		 * validity check failure during GC) to avoid endless GC loop in
-		 * such cases.
-		 */
-		if (test_bit(segno, sm->invalid_segmap))
-			goto next;
+entropy_retry:
+    bucket = sit_i->cur_bucket[p.dirty_type];
+    head = &sit_i->entropy_victim_buckets[bucket][p.dirty_type];
+    p.offset = sit_i->cur_bucket_last_victim[p.dirty_type];
+
+    while (1) {
+      unsigned long *dirty_bitmap;
+      unsigned int unit_no, segno;
+      unsigned int last_segment_bucket = (bucket + 1) * sit_i->entropy_bucket_width / 1000 - 1;
+      if (last_segment_bucket > last_segment) {
+        last_segment_bucket = last_segment;
+      }
+      dirty_bitmap = p.dirty_bitmap;
+      
+      unit_no = find_next_bit(dirty_bitmap,
+          last_segment / p.ofs_unit,
+          p.offset / p.ofs_unit);
+      segno = unit_no * p.ofs_unit;
+      if (segno >= last_segment_bucket) {
+        // If segno reaches last segment of bucket, visit other buckets
+        if (sit_i->bucket_selected[p.dirty_type] == 0) {
+          n++;
+          if (n < ENTROPY_BUCKET_NR) {
+            sit_i->cur_bucket[p.dirty_type] = sit_i->freq_sorted[n].bucket;
+            sit_i->cur_bucket_last_victim[p.dirty_type] = 
+              sit_i->cur_bucket[p.dirty_type] * sit_i->entropy_bucket_width / 1000;
+            goto entropy_retry; 
+          }
+          sit_i->cur_bucket[p.dirty_type] = NULL_SEGNO;
+          goto entropy_done;
+        } else {
+          sit_i->cur_bucket[p.dirty_type] = NULL_SEGNO;
+          goto entropy_resort;
+        }
+      }
+      secno = GET_SEC_FROM_SEG(sbi, segno);
+      nsearched++;
+
+      p.offset = segno + p.ofs_unit;
+
+      if (sec_usage_check(sbi, secno)) {
+        //printk("(%s:%d)bucket(%d)", __func__, __LINE__, bucket);
+        continue;
+      }
+
+      /* Don't touch checkpointed data */
+      if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED))) {
+        if (p.alloc_mode == LFS) {
+          /*
+           * LFS is set to find source section during GC.
+           * The victim should have no checkpointed data.
+           */
+          if (get_ckpt_valid_blocks(sbi, segno, true))
+            continue;
+        } else {
+          /*
+           * SSR | AT_SSR are set to find target segment
+           * for writes which can be full by checkpointed
+           * and newly written blocks.
+           */
+          if (!f2fs_segment_has_free_slot(sbi, segno))
+            continue;
+        }
+      }
+
+      if (gc_type == BG_GC && test_bit(secno, dirty_i->victim_secmap)) {
+        //printk("(%s:%d)bucket(%d)", __func__, __LINE__, bucket);
+        continue;
+      }
+
+      if (gc_type == FG_GC && f2fs_section_is_pinned(dirty_i, secno)) {
+        //printk("(%s:%d)bucket(%d)", __func__, __LINE__, bucket);
+        continue;
+      }
+
+      if (is_atgc) {
+        add_victim_entry(sbi, &p, segno);
+        //printk("(%s:%d)bucket(%d)", __func__, __LINE__, bucket);
+        continue;
+      }
+
+      if (get_gc_cost(sbi, segno, &p) >= 512) {
+        //printk("(%s:%d) get gc cost over 512, bucket(%d) valid %u ckpt %u cost %u", __func__, __LINE__, bucket, 
+        //  get_valid_blocks(sbi, segno, false), get_seg_entry(sbi,segno)->ckpt_valid_blocks,
+        //  get_gc_cost(sbi, segno, &p));
+        continue;
+      }
+
+      p.min_segno=segno;
+      p.min_cost = get_gc_cost(sbi, segno, &p) ;
+      nsearched_in_bucket++;
+      sit_i->bucket_selected[p.dirty_type]++;
+      sit_i->cur_bucket_last_victim[p.dirty_type] = segno;
+/*
+      if (sit_i->cur_bucket_iterate[p.dirty_type] % 100 == 0) {
+        printk("bucket(%d) segno(%u) selected in iterate (%ld)", 
+          bucket, segno, sit_i->cur_bucket_iterate[p.dirty_type]);
+      }
+*/
+      goto entropy_done;
+    }
+//    printk("bucket(%d) has no dirty segment", bucket);
+//    f2fs_bug_on(sbi, 1);
+//    }
+  
+entropy_done:
+#if 0
+  if (p.min_segno != NULL_SEGNO) {
+    bucket = 1000 * p.min_segno / sit_i->entropy_bucket_width;
+    if (bucket >= ENTROPY_BUCKET_NR) {
+      printk("calc error");
+      bucket = ENTROPY_BUCKET_NR-1;
+    } 
+  } else {
+    bucket = NULL_SEGNO;
+  }
+  printk("segno %u bucket %u", p.min_segno, bucket);
+#endif 
+  } else {
 #endif
+    while (1) {
+      unsigned long cost, *dirty_bitmap;
+      unsigned int unit_no, segno;
 
-		secno = GET_SEC_FROM_SEG(sbi, segno);
+      dirty_bitmap = p.dirty_bitmap;
+      unit_no = find_next_bit(dirty_bitmap,
+          last_segment / p.ofs_unit,
+          p.offset / p.ofs_unit);
+      segno = unit_no * p.ofs_unit;
+      if (segno >= last_segment) {
+        if (sm->last_victim[p.gc_mode]) {
+          last_segment =
+            sm->last_victim[p.gc_mode];
+          sm->last_victim[p.gc_mode] = 0;
+          p.offset = 0;
+          continue;
+        }
+        last_searched = segno;
+        break;
+      }
 
-		if (sec_usage_check(sbi, secno))
-			goto next;
+      p.offset = segno + p.ofs_unit;
+      nsearched++;
 
-		/* Don't touch checkpointed data */
-		if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED))) {
-			if (p.alloc_mode == LFS) {
-				/*
-				 * LFS is set to find source section during GC.
-				 * The victim should have no checkpointed data.
-				 */
-				if (get_ckpt_valid_blocks(sbi, segno, true))
-					goto next;
-			} else {
-				/*
-				 * SSR | AT_SSR are set to find target segment
-				 * for writes which can be full by checkpointed
-				 * and newly written blocks.
-				 */
-				if (!f2fs_segment_has_free_slot(sbi, segno))
-					goto next;
-			}
-		}
+  #ifdef CONFIG_F2FS_CHECK_FS
+      /*
+       * skip selecting the invalid segno (that is failed due to block
+       * validity check failure during GC) to avoid endless GC loop in
+       * such cases.
+       */
+      if (test_bit(segno, sm->invalid_segmap))
+        goto next;
+  #endif
 
-		if (gc_type == BG_GC && test_bit(secno, dirty_i->victim_secmap))
-			goto next;
+      secno = GET_SEC_FROM_SEG(sbi, segno);
 
-		if (gc_type == FG_GC && f2fs_section_is_pinned(dirty_i, secno))
-			goto next;
+      if (sec_usage_check(sbi, secno))
+        goto next;
 
-		if (is_atgc) {
-			add_victim_entry(sbi, &p, segno);
-			goto next;
-		}
+      /* Don't touch checkpointed data */
+      if (unlikely(is_sbi_flag_set(sbi, SBI_CP_DISABLED))) {
+        if (p.alloc_mode == LFS) {
+          /*
+           * LFS is set to find source section during GC.
+           * The victim should have no checkpointed data.
+           */
+          if (get_ckpt_valid_blocks(sbi, segno, true))
+            goto next;
+        } else {
+          /*
+           * SSR | AT_SSR are set to find target segment
+           * for writes which can be full by checkpointed
+           * and newly written blocks.
+           */
+          if (!f2fs_segment_has_free_slot(sbi, segno))
+            goto next;
+        }
+      }
 
-		cost = get_gc_cost(sbi, segno, &p);
+      if (gc_type == BG_GC && test_bit(secno, dirty_i->victim_secmap))
+        goto next;
 
-		if (p.min_cost > cost) {
-			p.min_segno = segno;
-			p.min_cost = cost;
-		}
-next:
-		if (nsearched >= p.max_search) {
-			if (!sm->last_victim[p.gc_mode] && segno <= last_victim)
-				sm->last_victim[p.gc_mode] =
-					last_victim + p.ofs_unit;
-			else
-				sm->last_victim[p.gc_mode] = segno + p.ofs_unit;
-			sm->last_victim[p.gc_mode] %=
-				(MAIN_SECS(sbi) * SEGS_PER_SEC(sbi));
-			break;
-		}
-	}
+      if (gc_type == FG_GC && f2fs_section_is_pinned(dirty_i, secno))
+        goto next;
 
+      if (is_atgc) {
+        add_victim_entry(sbi, &p, segno);
+        goto next;
+      }
+
+      cost = get_gc_cost(sbi, segno, &p);
+
+      if (p.min_cost > cost) {
+        p.min_segno = segno;
+        p.min_cost = cost;
+      }
+  next:
+      if (nsearched >= p.max_search) {
+        if (!sm->last_victim[p.gc_mode] && segno <= last_victim)
+          sm->last_victim[p.gc_mode] =
+            last_victim + p.ofs_unit;
+        else
+          sm->last_victim[p.gc_mode] = segno + p.ofs_unit;
+        sm->last_victim[p.gc_mode] %=
+          (MAIN_SECS(sbi) * SEGS_PER_SEC(sbi));
+        last_searched = segno;
+        break;
+      }
+    }
+#if  S4 || ENTROPY
+  }
+#endif // S4
+//  printk("nsearched %u cost %u", nsearched, p.min_cost);
+
+//  if (p.min_segno != NULL_SEGNO && p.alloc_mode == SSR) {
+//    struct seg_entry *seg_entry = get_seg_entry(sbi, p.min_segno);
+//    ktime_t now = ktime_get_raw(); 
+//    printk("GC %lld %u %u %u %u", now, p.min_segno, seg_entry->ckpt_valid_blocks, last_victim, last_searched); 
+//    printk("cost diff: nrsearched %u p.min_cost %u get_gc_cost %u valid_block %u ckpt_validblock %u cb_cost %u alloc_mode %d dirty_type %d", 
+//    nsearched, p.min_cost, get_gc_cost(sbi, p.min_segno, &p), get_valid_blocks(sbi, p.min_segno, true), 
+//    seg_entry->ckpt_valid_blocks, get_cb_cost(sbi, p.min_segno), p.alloc_mode, p.dirty_type);
+//  } 
+//  else {
+//   printk("cost diff: nrsearched %u p.min_cost %u alloc_mode %d dirty_type %d", nsearched, p.min_cost, p.alloc_mode, p.dirty_type);
+//  }
+
+/*
+#if S4
+  if (alloc_mode == SSR && p.dirty_type <= DIRTY_COLD_DATA) {
+#else
+  if (alloc_mode == SSR && type <= DIRTY_COLD_DATA) {
+#endif
+    struct seg_entry *seg_entry = get_seg_entry(sbi, p.min_segno);
+    printk("%u %u %u %u", p.min_cost, get_gc_cost(sbi, p.min_segno, &p), seg_entry->valid_blocks, seg_entry->ckpt_valid_blocks);
+  }
+*/
 	/* get victim for GC_AT/AT_SSR */
 	if (is_atgc) {
 		lookup_victim_by_age(sbi, &p);
@@ -932,7 +1185,13 @@ out:
 				sbi->cur_victim_sec,
 				prefree_segments(sbi), free_segments(sbi));
 	mutex_unlock(&dirty_i->seglist_lock);
-
+#if PROFILE_MIDDLE
+  if (p.alloc_mode == SSR) {
+    sbi->ssr_ckpt_valid_blocks += p.min_cost;
+    ktime_get_raw_ts64(&ts[1]);
+    calclock(ts, &sbi->ssr_time, &sbi->ssr_cnt);
+  }
+#endif
 	return ret;
 }
 
@@ -1813,7 +2072,21 @@ int f2fs_gc(struct f2fs_sb_info *sbi, struct f2fs_gc_control *gc_control)
 	};
 	unsigned int skipped_round = 0, round = 0;
 	unsigned int upper_secs;
+#if BREAKDOWN
+// total:0, victim:1, copy:2
+  struct timespec64 ts[3][2];
+  unsigned long long phaseTime[3];
+  unsigned long long phaseCnt[3];
+  int bd;
+  for (bd=0;bd<3;bd++){
+    phaseTime[bd]=0;
+    phaseCnt[bd]=0;
+  }
 
+  //total
+  ktime_get_raw_ts64(&ts[0][0]);
+
+#endif
 	trace_f2fs_gc_begin(sbi->sb, gc_type, gc_control->no_bg_gc,
 				gc_control->nr_free_secs,
 				get_pages(sbi, F2FS_DIRTY_NODES),
@@ -1861,7 +2134,15 @@ gc_more:
 		goto stop;
 	}
 retry:
+#if BREAKDOWN
+// get_vict
+  ktime_get_raw_ts64(&ts[1][0]);
 	ret = __get_victim(sbi, &segno, gc_type);
+  ktime_get_raw_ts64(&ts[1][1]);
+  calclock(ts[1], &phaseTime[1], &phaseCnt[1]);
+#else
+	ret = __get_victim(sbi, &segno, gc_type);
+#endif
 	if (ret) {
 		/* allow to search victim from sections has pinned data */
 		if (ret == -ENODATA && gc_type == FG_GC &&
@@ -1871,9 +2152,17 @@ retry:
 		}
 		goto stop;
 	}
-
+// copy
+#if BREAKDOWN
+  ktime_get_raw_ts64(&ts[2][0]);
 	seg_freed = do_garbage_collect(sbi, segno, &gc_list, gc_type,
 				gc_control->should_migrate_blocks);
+  ktime_get_raw_ts64(&ts[2][1]);
+  calclock(ts[2], &phaseTime[2], &phaseCnt[2]);
+#else
+	seg_freed = do_garbage_collect(sbi, segno, &gc_list, gc_type,
+				gc_control->should_migrate_blocks);
+#endif
 	total_freed += seg_freed;
 
 	if (seg_freed == f2fs_usable_segs_in_sec(sbi, segno)) {
@@ -1944,6 +2233,12 @@ stop:
 
 	if (gc_control->err_gc_skipped && !ret)
 		ret = total_sec_freed ? 0 : -EAGAIN;
+#if BREAKDOWN
+  ktime_get_raw_ts64(&ts[0][1]);
+  calclock(ts[0], &phaseTime[0], &phaseCnt[0]);
+	printk("%llu %llu %llu %llu %llu %llu",
+    phaseTime[0], phaseCnt[0], phaseTime[1], phaseCnt[1], phaseTime[2], phaseCnt[2]);
+#endif
 	return ret;
 }
 
