@@ -1,16 +1,23 @@
-## Hi there 👋
+## RX-LFS: What are the Efficient Write Patterns for Log-structured File Systems on Solid-state Drives?
 
-<!--
-**RX-LFS/RX-LFS** is a ✨ _special_ ✨ repository because its `README.md` (this file) appears on your GitHub profile.
+# Build / Install
+- Follow the same steps as the existing kernel build and installation
+- Refer to https://docs.kernel.org/kbuild/index.html to build The Linux kernel
+- For example,
+```
+make oldconfig
+make -j
+make modules -j
+sudo make modules_install
+sudo make install
+sudo reboot
+```
+- The implementation of RX-LFS is based on F2FS. RX-LFS module is compiled as linux-6.6.52/fs/f2fs/f2fs.ko
 
-Here are some ideas to get you started:
-
-- 🔭 I’m currently working on ...
-- 🌱 I’m currently learning ...
-- 👯 I’m looking to collaborate on ...
-- 🤔 I’m looking for help with ...
-- 💬 Ask me about ...
-- 📫 How to reach me: ...
-- 😄 Pronouns: ...
-- ⚡ Fun fact: ...
--->
+# Usage
+- MKfs/mount example with nvme0n1
+```
+mkfs.f2fs /dev/nvme0n1
+insmod linux-6.6.52/fs/f2fs/f2fs.ko
+sudo mount /dev/nvme0n1 /mnt/RXLFS
+```
